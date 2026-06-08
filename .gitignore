@@ -1,0 +1,22 @@
+# API keys
+.env
+
+# TDLib session data
+data/tdlib/
+
+# Python virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# opencode
+.opencode/node_modules/
+.opencode/package-lock.json
+.opencode/opencode.jsonc
+.opencode/opencode.json
