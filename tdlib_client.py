@@ -43,6 +43,7 @@ class TDLibClient:
         self._pending: dict[str, asyncio.Future] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._ready = threading.Event()
+        self._error: BaseException | None = None
 
     def _setup_ctypes(self):
         self._lib.td_set_log_verbosity_level(1)
@@ -147,6 +148,85 @@ class TDLibClient:
         if future and not future.done():
             self._loop.call_soon_threadsafe(future.set_result, response)
 
+    def _fail_pending(self, extra: str, error: Exception):
+        future = self._pending.pop(extra, None)
+        if future and not future.done():
+            self._loop.call_soon_threadsafe(future.set_exception, error)
+
+    def _run_request(self, request: dict):
+        extra = request["@extra"]
+        timeout = request.pop("_timeout", 30.0)
+        request_type = request.get("@type", "unknown")
+
+        retries = 0
+        max_retries = 3
+
+        while retries <= max_retries:
+            logger.debug(
+                f"Sending request @extra={extra[:8]} type={request_type}"
+                + (f" retry={retries}" if retries else "")
+            )
+            self._send(request)
+
+            start = time.time()
+            while time.time() - start < timeout:
+                response = self._receive(1.0)
+                if not response:
+                    continue
+
+                resp_type = response.get("@type")
+                resp_extra = response.get("@extra", "")
+
+                if resp_extra and resp_extra in self._pending:
+                    if resp_type == "error":
+                        code = response.get("code", 0)
+                        msg = response.get("message", "")
+
+                        if retries < max_retries and self._should_retry(code, msg):
+                            wait = self._parse_flood_wait(msg) or (2 ** retries)
+                            retries += 1
+                            logger.warning(
+                                f"Retry {retries}/{max_retries} for {request_type} "
+                                f"in {wait}s (code={code}): {msg}"
+                            )
+                            time.sleep(wait)
+                            break
+
+                    self._resolve_pending(extra, response)
+                    return
+
+                elif resp_type == "updateAuthorizationState":
+                    state = response.get("authorization_state", {}).get("@type")
+                    if state == "authorizationStateClosed":
+                        logger.error("TDLib closed, shutting down")
+                        self._fail_pending(extra, TDLibError("TDLib closed"))
+                        return
+                elif resp_type == "error":
+                    logger.error(f"Unmatched error: {response.get('code')}: {response.get('message')}")
+            else:
+                self._fail_pending(extra, TDLibError(f"Request timeout after {timeout}s"))
+                return
+
+    def _should_retry(self, code: int, message: str) -> bool:
+        if code == 420:
+            return True
+        if code in (500, 502, 503, 504):
+            return True
+        if "network" in message.lower() or "connection" in message.lower():
+            return True
+        return False
+
+    def _parse_flood_wait(self, message: str) -> int | None:
+        if "FLOOD_WAIT" not in message:
+            return None
+        import re
+        m = re.search(r"FLOOD_WAIT:\s*(\d+)", message)
+        return min(int(m.group(1)) + 1, 30) if m else 5
+
+    def _cancel_all_pending(self):
+        for extra in list(self._pending.keys()):
+            self._fail_pending(extra, TDLibError("Server shutting down"))
+
     def _tdlib_thread(self):
         self._error = None
         try:
@@ -169,27 +249,14 @@ class TDLibClient:
 
                 if "@extra" not in request:
                     continue
-                req_id = request["@extra"]
-                timeout = request.pop("_timeout", 30.0)
-                logger.debug(f"Sending request @extra={req_id[:8]} type={request.get('@type')}")
-                self._send(request)
 
-                start = time.time()
-                while time.time() - start < timeout:
-                    response = self._receive(1.0)
-                    if not response:
-                        continue
-                    resp_type = response.get("@type")
-                    resp_extra = response.get("@extra", "")
-                    if resp_extra and resp_extra in self._pending:
-                        logger.debug(f"Got response @extra={resp_extra[:8]} type={resp_type}")
-                        self._resolve_pending(resp_extra, response)
-                        break
+                self._run_request(request)
         except Exception as e:
             logger.exception("TDLib thread crashed")
             self._error = e
         finally:
             self._ready.set()
+            self._cancel_all_pending()
             if self._client:
                 self._lib.td_json_client_destroy(self._client)
                 self._client = None
@@ -208,10 +275,14 @@ class TDLibClient:
 
     def stop(self):
         self._running = False
+        self._cancel_all_pending()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
 
     async def send_request(self, request: dict, timeout: float = 30.0) -> dict:
+        if self._error:
+            raise TDLibError(f"Client in error state: {self._error}")
+
         req_id = str(uuid.uuid4())
         request["@extra"] = req_id
 
@@ -220,7 +291,7 @@ class TDLibClient:
         self._request_queue.put(request)
 
         try:
-            response = await asyncio.wait_for(future, timeout=timeout)
+            response = await asyncio.wait_for(future, timeout=timeout + 10)
             if response.get("@type") == "error":
                 raise TDLibError(f"{response['code']}: {response['message']}")
             return response

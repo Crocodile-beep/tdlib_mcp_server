@@ -1,6 +1,8 @@
+import asyncio
 import json
 import logging
 import os
+import signal
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -23,6 +25,7 @@ logger = logging.getLogger("tdlib-mcp")
 server = Server("tdlib-mcp")
 
 client: TDLibClient | None = None
+_shutdown_event = asyncio.Event()
 
 
 @server.list_tools()
@@ -224,6 +227,11 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
         return [TextContent(type="text", text=f"Error: {e}")]
 
 
+def _handle_shutdown():
+    logger.info("Shutdown signal received, stopping...")
+    _shutdown_event.set()
+
+
 async def main():
     global client
 
@@ -249,8 +257,12 @@ async def main():
     await client.start()
     logger.info("TDLib client ready")
 
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, _handle_shutdown)
+
     async with stdio_server() as (read_stream, write_stream):
-        await server.run(
+        init_task = asyncio.create_task(server.run(
             read_stream,
             write_stream,
             InitializationOptions(
@@ -258,9 +270,16 @@ async def main():
                 server_version="0.1.0",
                 capabilities=ServerCapabilities(tools=ToolsCapability(list_changed=True)),
             ),
+        ))
+        shutdown_task = asyncio.create_task(_shutdown_event.wait())
+        await asyncio.wait(
+            [init_task, shutdown_task],
+            return_when=asyncio.FIRST_COMPLETED,
         )
 
+    logger.info("Shutting down TDLib client...")
     client.stop()
+    logger.info("Shutdown complete")
 
 
 if __name__ == "__main__":
